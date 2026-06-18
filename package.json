@@ -1,0 +1,13 @@
+{
+  "name": "ai-answer-scout-gemini",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Gemini-powered local AI visibility scout for niche validation and lead-gen research.",
+  "scripts": {
+    "dev": "netlify dev",
+    "start": "netlify dev"
+  },
+  "devDependencies": {
+    "netlify-cli": "latest"
+  }
+}

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Answer Scout Gemini — Local AI Visibility Runner</title>
+  <meta name="description" content="Automated local AI visibility scouting for niche validation, competitor discovery, and source mapping." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-grid">
+      <div>
+        <p class="eyebrow">Internal market intelligence runner</p>
+        <h1>AI Answer Scout Gemini</h1>
+        <p class="lede">Enter a service niche and markets. The app generates local buyer-intent prompts, runs Gemini through a Netlify Function, extracts named businesses and sources, scores the opportunity, and stores the results.</p>
+      </div>
+      <div class="hero-card">
+        <span class="status-dot"></span>
+        <strong>No manual paste loop.</strong>
+        <p>One form. Batch run. Gemini does the scouting. The spreadsheet intern remains unemployed.</p>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap app-shell">
+    <section class="panel runner-panel" aria-labelledby="runner-title">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Batch scout</p>
+          <h2 id="runner-title">Run Gemini-powered local AI checks</h2>
+        </div>
+        <button id="loadHotTub" class="ghost-btn" type="button">Load hot tub sample</button>
+      </div>
+
+      <form id="runnerForm" autocomplete="off">
+        <div class="grid two">
+          <label>Project / niche
+            <input id="project" placeholder="Hot tub removal" required />
+          </label>
+          <label>Service category
+            <input id="service" placeholder="hot tub removal service" required />
+          </label>
+        </div>
+
+        <div class="grid two">
+          <label>Markets <small>one per line; 2–8 is sane</small>
+            <textarea id="markets" rows="7" placeholder="Salt Lake City, UT\nDenver, CO\nBoise, ID" required></textarea>
+          </label>
+          <label>Custom query templates <small>optional; use {service} and {market}</small>
+            <textarea id="templates" rows="7" placeholder="best {service} in {market}\nwho offers {service} near {market}\n{service} cost in {market}\nwhat to check before hiring a {service} in {market}"></textarea>
+          </label>
+        </div>
+
+        <div class="grid three">
+          <label>Run depth
+            <select id="depth">
+              <option value="fast">Fast — 2 queries per market</option>
+              <option value="standard" selected>Standard — 4 queries per market</option>
+              <option value="deep">Deep — 6 queries per market</option>
+            </select>
+          </label>
+          <label>Scout mode
+            <select id="mode">
+              <option value="niche-validation" selected>Niche validation</option>
+              <option value="competitor-map">Competitor map</option>
+              <option value="pre-action-gap">Pre-action gap</option>
+              <option value="lead-gen-router">Lead-gen router</option>
+            </select>
+          </label>
+          <label>Gemini provider mode
+            <select id="scoutProvider">
+              <option value="gemini-fast" selected>Gemini Fast Scout — free-tier friendly</option>
+              <option value="gemini-grounded">Gemini Grounded Search — stronger, may need billing/quota</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="grid two model-row">
+          <label>Model override <small>optional</small>
+            <input id="model" placeholder="gemini-2.5-flash or leave blank" />
+          </label>
+          <div class="field-note">
+            <strong>Recommended start:</strong> use Fast Scout first. Try Grounded Search only after the basic Gemini key works. Because of course the button that says “search the web” is where billing gremlins live.
+          </div>
+        </div>
+
+        <details class="advanced-box">
+          <summary>Optional context / guardrails</summary>
+          <label>Notes for the scout
+            <textarea id="notes" rows="4" placeholder="Example: We prefer pre-action decision pages, avoid DIY execution, watch for directories and national-brand dominance."></textarea>
+          </label>
+        </details>
+
+        <div class="actions">
+          <button type="submit" class="primary-btn" id="runBtn">Run scout batch</button>
+          <button type="button" id="resetRunner" class="ghost-btn">Clear form</button>
+        </div>
+      </form>
+
+      <div id="runStatus" class="run-status" aria-live="polite"></div>
+    </section>
+
+    <aside class="panel score-panel" aria-labelledby="summary-title">
+      <p class="eyebrow">Batch diagnosis</p>
+      <h2 id="summary-title">Latest Run</h2>
+      <div class="score-ring"><span id="avgScore">0</span><small>/100</small></div>
+      <p id="runLabel" class="score-label">No run yet.</p>
+      <div class="diagnosis" id="runDiagnosis">
+        <p>Run a batch to see whether the niche has weak AI answers, directory dependence, fragmented local operators, and a usable content or lead-gen opening.</p>
+      </div>
+      <hr />
+      <h3>What this automates</h3>
+      <ul class="mini-list">
+        <li>Query generation</li>
+        <li>Gemini API lookup</li>
+        <li>Business/source extraction</li>
+        <li>Opportunity scoring</li>
+        <li>CSV/JSON export</li>
+      </ul>
+    </aside>
+
+    <section class="panel full table-panel" aria-labelledby="entries-title">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Saved intelligence</p>
+          <h2 id="entries-title">Scout Log</h2>
+        </div>
+        <div class="button-row">
+          <button id="exportCsv" class="ghost-btn" type="button">Export CSV</button>
+          <button id="exportJson" class="ghost-btn" type="button">Export JSON</button>
+          <label class="import-btn">Import JSON <input id="importJson" type="file" accept="application/json" /></label>
+          <button id="clearAll" class="danger-btn" type="button">Clear all</button>
+        </div>
+      </div>
+
+      <div class="filters">
+        <input id="searchEntries" placeholder="Filter by niche, city, query, business, source, opening..." />
+        <select id="sortEntries">
+          <option value="newest">Newest first</option>
+          <option value="scoreDesc">Highest score</option>
+          <option value="scoreAsc">Lowest score</option>
+          <option value="market">Market A-Z</option>
+        </select>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Project</th>
+              <th>Market</th>
+              <th>Query</th>
+              <th>Named businesses</th>
+              <th>Sources</th>
+              <th>Answer type</th>
+              <th>Score</th>
+              <th>Opening</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="entriesBody"></tbody>
+        </table>
+      </div>
+      <p id="emptyState" class="empty-state">No entries yet. Run a batch and let the machine do the boring part like a civilized little robot.</p>
+    </section>
+
+    <section class="panel full method-panel">
+      <p class="eyebrow">Reality note</p>
+      <h2>What “automated” means here</h2>
+      <div class="method-grid">
+        <div><strong>It runs the scout batch.</strong><p>Fast Scout uses Gemini reasoning. Grounded Search asks Gemini to use Google Search grounding when your account/model supports it.</p></div>
+        <div><strong>It does not impersonate every platform.</strong><p>ChatGPT, Gemini, Perplexity, and Google AI each have their own behavior. This is automated scouting, not legal-grade platform rank tracking.</p></div>
+        <div><strong>It needs one Gemini API key.</strong><p>True automation requires a server-side API provider. Store GEMINI_API_KEY as a Netlify environment variable, never in browser code.</p></div>
+        <div><strong>It is for niche decisions.</strong><p>Use it to decide what to build, which cities to test, and where weak answer patterns appear. Do not sell it as ranking proof.</p></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap footer">
+    <p>AI Answer Scout Gemini is an internal research aid. AI answers vary by time, location, model, account, and platform. Treat outputs as directional intelligence, not proof of ranking, demand, or platform inclusion.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
