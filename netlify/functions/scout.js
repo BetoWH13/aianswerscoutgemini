@@ -31,6 +31,27 @@ exports.handler = async function (event) {
     });
   }
 
+  const requiredAppPassword = String(process.env.BETO_SCOUT_APP_PASSWORD || '').trim();
+
+  if (!requiredAppPassword) {
+    return json(500, {
+      error: 'Missing BETO_SCOUT_APP_PASSWORD.',
+      fix: 'Add BETO_SCOUT_APP_PASSWORD in Netlify environment variables, then clear-cache redeploy.'
+    });
+  }
+
+  const suppliedAppPassword = String(
+    event.headers['x-scout-password'] ||
+    event.headers['X-Scout-Password'] ||
+    ''
+  ).trim();
+
+  if (suppliedAppPassword !== requiredAppPassword) {
+    return json(401, {
+      error: 'Private scout password required.'
+    });
+  }
+
   try {
     const apiKey = firstEnv(SECRET_NAMES);
 
@@ -97,8 +118,6 @@ exports.handler = async function (event) {
     const entries = parsed.entries.map(entry =>
       normalizeEntry({
         entry,
-        project,
-        service,
         useGoogleSearch,
         groundingSources
       })
@@ -115,7 +134,7 @@ exports.handler = async function (event) {
   } catch (error) {
     return json(500, {
       error: error.message || 'Scout function crashed.',
-      hint: 'If this keeps failing, open Netlify > Functions > scout > Logs. Also confirm BETO_SCOUT_PROVIDER_TOKEN exists and BETO_SCOUT_MODEL is blank.'
+      hint: 'If this keeps failing, open Netlify > Functions > scout > Logs. Confirm BETO_SCOUT_PROVIDER_TOKEN exists, BETO_SCOUT_APP_PASSWORD exists, and BETO_SCOUT_MODEL is blank.'
     });
   }
 };
@@ -565,7 +584,7 @@ function json(statusCode, body) {
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Scout-Password',
       'Access-Control-Allow-Methods': 'POST, OPTIONS'
     },
     body: statusCode === 204 ? '' : JSON.stringify(body)
