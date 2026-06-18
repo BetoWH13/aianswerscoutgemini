@@ -94,19 +94,21 @@ exports.handler = async function(event) {
 
     const groundingSources = extractGroundingSources(data);
 
+    const entries = parsed.entries.map(entry =>
+      normalizeEntry({
+        entry,
+        groundingSources,
+        useGoogleSearch
+      })
+    );
+
     return json(200, {
       provider: useGoogleSearch ? 'Gemini grounded scout' : 'Gemini fast scout',
       model: selectedModel,
       requestedModel: requestedModel || null,
       grounded: useGoogleSearch,
       groundingSources,
-      entries: parsed.entries.map(entry => ({
-        ...entry,
-        citations:
-          Array.isArray(entry.citations) && entry.citations.length
-            ? entry.citations
-            : groundingSources
-      })),
+      entries,
       batchSummary: parsed.batchSummary || ''
     });
   } catch (err) {
@@ -123,7 +125,6 @@ exports.handler = async function(event) {
 function firstEnv(names) {
   for (const name of names) {
     const value = (process.env[name] || '').trim();
-
     if (value) return value;
   }
 
@@ -156,13 +157,11 @@ async function chooseUsableModel({ apiKey, requestedModel }) {
 
   if (requestedModel) {
     const exact = usable.find(m => m.shortName === requestedModel);
-
     if (exact) return exact.shortName;
   }
 
   for (const preferred of PREFERRED_MODELS) {
     const exact = usable.find(m => m.shortName === preferred);
-
     if (exact) return exact.shortName;
   }
 
@@ -223,8 +222,8 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
       }
     ],
     generationConfig: {
-      temperature: 0.2,
-      topP: 0.9,
+      temperature: 0.15,
+      topP: 0.85,
       maxOutputTokens: 8192,
       responseMimeType: 'application/json'
     }
@@ -267,23 +266,222 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
   return data;
 }
 
+function normalizeEntry({ entry, groundingSources, useGoogleSearch }) {
+  const normalized = {
+    market: safeString(entry.market),
+    query: safeString(entry.query),
+    answerType: safeString(entry.answerType),
+    confidence: safeString(entry.confidence),
+    businesses: toArray(entry.businesses),
+    sources: toArray(entry.sources),
+    citations: normalizeCitations(entry.citations, groundingSources, useGoogleSearch),
+    flags: normalizeFlags(entry.flags),
+    summary: safeString(entry.summary),
+    opening: rewriteOpening(safeString(entry.opening), safeString(entry.query), safeString(entry.summary)),
+    rawAnswer: safeString(entry.rawAnswer),
+    score: clampScore(entry.score)
+  };
+
+  const adjusted = adjustScore(normalized, useGoogleSearch);
+
+  normalized.score = adjusted.score;
+  normalized.scoreRationale = adjusted.rationale.join(' | ');
+
+  return normalized;
+}
+
+function normalizeFlags(flags = {}) {
+  return {
+    nationalBrands: Boolean(flags.nationalBrands),
+    localOperators: Boolean(flags.localOperators),
+    aggregators: Boolean(flags.aggregators),
+    weakAnswer: Boolean(flags.weakAnswer),
+    preAction: Boolean(flags.preAction),
+    buyerIntent: Boolean(flags.buyerIntent)
+  };
+}
+
+function normalizeCitations(citations, groundingSources, useGoogleSearch) {
+  const fromEntry = toArray(citations).filter(Boolean);
+  const realUrls = fromEntry.filter(x => /^https?:\/\//i.test(x));
+
+  if (realUrls.length) return realUrls;
+
+  if (Array.isArray(groundingSources) && groundingSources.length) return groundingSources;
+
+  return [
+    useGoogleSearch
+      ? 'grounded search produced no usable citation'
+      : 'fast scout mode: ungrounded pattern estimate'
+  ];
+}
+
+function adjustScore(entry, useGoogleSearch) {
+  let score = clampScore(entry.score);
+  const rationale = [];
+
+  const citationText = entry.citations.join(' ').toLowerCase();
+  const hasRealCitation = entry.citations.some(x => /^https?:\/\//i.test(x));
+  const weakCitation =
+    citationText.includes('ungrounded') ||
+    citationText.includes('unavailable') ||
+    citationText.includes('weak') ||
+    citationText.includes('no usable');
+
+  const confidence = entry.confidence.toLowerCase();
+  const answerType = entry.answerType.toLowerCase();
+  const opening = entry.opening.toLowerCase();
+  const summary = entry.summary.toLowerCase();
+
+  if (!useGoogleSearch || !hasRealCitation || weakCitation) {
+    score -= 14;
+    rationale.push('citation penalty: ungrounded/weak evidence');
+  }
+
+  if (confidence.includes('weak') || confidence.includes('vague')) {
+    score -= 10;
+    rationale.push('confidence penalty: weak/vague');
+  } else if (confidence.includes('medium') || confidence.includes('plausible')) {
+    score -= 6;
+    rationale.push('confidence penalty: plausible but not proven');
+  } else if (confidence.includes('suspicious') || confidence.includes('hallucinated')) {
+    score -= 22;
+    rationale.push('confidence penalty: suspicious/hallucinated');
+  }
+
+  if (entry.flags.buyerIntent) {
+    score += 8;
+    rationale.push('buyer intent bonus');
+  }
+
+  if (entry.flags.aggregators) {
+    score += 6;
+    rationale.push('aggregator dependence bonus');
+  }
+
+  if (entry.flags.weakAnswer) {
+    score += 8;
+    rationale.push('weak answer bonus');
+  }
+
+  if (entry.flags.preAction) {
+    score += 7;
+    rationale.push('pre-action angle bonus');
+  }
+
+  if (entry.flags.nationalBrands && entry.flags.localOperators) {
+    score += 4;
+    rationale.push('mixed national/local field bonus');
+  }
+
+  if (answerType.includes('directory-heavy')) {
+    score += 4;
+    rationale.push('directory-heavy bonus');
+  }
+
+  if (looksLikeSalesCopy(opening)) {
+    score -= 8;
+    rationale.push('opening penalty: sales-copy wording');
+  }
+
+  if (summary.includes('limited deep analysis') || summary.includes('generic advice') || summary.includes('star ratings')) {
+    score += 4;
+    rationale.push('shallow-answer opportunity bonus');
+  }
+
+  if (!entry.businesses.length) {
+    score -= 8;
+    rationale.push('no named entities penalty');
+  }
+
+  const allFlagsTrue = Object.values(entry.flags).every(Boolean);
+  if (allFlagsTrue && (!hasRealCitation || weakCitation)) {
+    score -= 8;
+    rationale.push('all-flags-true penalty without evidence');
+  }
+
+  score = clampScore(score);
+
+  return {
+    score,
+    rationale
+  };
+}
+
+function rewriteOpening(opening, query, summary) {
+  if (!opening || looksLikeSalesCopy(opening)) {
+    return [
+      'Build a pre-call decision page, not a fake “best company” list.',
+      'Focus on what makes this job harder than a normal pickup: access path, deck integration, electrical disconnect, water drainage, weight, cut-up/removal method, disposal rules, and when a junk hauler may not be enough.',
+      'Use the page to help the visitor decide what to check before calling, then route the call.'
+    ].join(' ');
+  }
+
+  return opening;
+}
+
+function looksLikeSalesCopy(text) {
+  const t = String(text || '').toLowerCase();
+
+  return (
+    t.includes('we connect') ||
+    t.includes('vetted') ||
+    t.includes('top-rated') ||
+    t.includes('hassle-free') ||
+    t.includes('curated list') ||
+    t.includes('our platform') ||
+    t.includes('reliable local providers') ||
+    t.includes('go beyond simple listings')
+  );
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) {
+    return value.map(x => String(x).trim()).filter(Boolean);
+  }
+
+  if (typeof value === 'string') {
+    return value
+      .split(/[,;\n]/)
+      .map(x => x.trim())
+      .filter(Boolean);
+  }
+
+  return [];
+}
+
+function safeString(value) {
+  return value == null ? '' : String(value).trim();
+}
+
+function clampScore(value) {
+  const n = Number(value);
+
+  if (!Number.isFinite(n)) return 40;
+
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
 function buildPrompt({ project, service, queries, mode, notes, useGoogleSearch }) {
-  return `Run a local AI-answer scout for niche validation. The goal is not to sell a SaaS report. The goal is to extract market intelligence for a small niche-site / lead-gen operator deciding what to build.
+  return `Run a local AI-answer scout for niche validation. The user is a small niche-site / affiliate / lead-gen operator. The goal is market intelligence, not a SaaS sales report.
+
+Be skeptical. Penalize unsupported certainty. Treat Fast Scout as pattern estimation, not proof. Do not invent exact citations or pretend live search was used. If you are not grounded, mark names and sources as likely patterns only.
 
 Provider mode: ${
     useGoogleSearch
-      ? 'Grounded Google Search is enabled. Use current web evidence where useful, but still mark uncertainty honestly.'
-      : 'Fast scout mode. Do not pretend to have live evidence. Use market-pattern reasoning, entity recognition, and local SEO heuristics. Mark uncertainty honestly.'
+      ? 'Grounded Google Search is enabled. Use current web evidence where useful. Cite real URLs only when actually used. If grounding is thin, say so.'
+      : 'Fast Scout mode. Live search is not available. Use market-pattern reasoning, entity recognition, and local SEO heuristics. Mark uncertainty honestly.'
   }
+
 Project: ${project}
 Service category: ${service}
 Scout mode: ${mode || 'niche-validation'}
 Operator notes: ${
     notes ||
-    'Prioritize weak AI answers, directory dependence, national-brand dominance, local fragmentation, pre-action uncertainty, and buyer/call intent.'
+    'Prioritize weak AI answers, directory dependence, national-brand dominance, local fragmentation, pre-action uncertainty, buyer/call intent, and whether a focused page can beat generic AI/local-pack mush.'
   }
 
-For each query below, infer what a consumer-facing AI/web answer would likely surface, then produce a structured record. Favor named entities, directories, sources, and observable patterns. Never claim proof of ranking. Never invent exact citations; if grounded search was unavailable or weak, say so in confidence/summary.
+For each query, infer the AI/web answer landscape. Do not write marketing copy. Do not say “we connect you with vetted providers.” We are not selling the visitor a SaaS report. We are deciding whether to build a niche page, router, or lead-gen test.
 
 Queries:
 ${queries.map((q, i) => `${i + 1}. [${q.market}] ${q.query}`).join('\n')}
@@ -292,7 +490,7 @@ Return ONLY valid JSON. No markdown. No commentary. Start with { and end with }.
 
 Schema:
 {
-  "batchSummary": "one concise paragraph",
+  "batchSummary": "one concise paragraph describing the repeated pattern and whether this is worth further testing",
   "entries": [
     {
       "market": "city/state",
@@ -311,20 +509,39 @@ Schema:
         "buyerIntent": true
       },
       "summary": "brief summary of what the answer landscape appears to show",
-      "opening": "specific content/router/lead-gen opening for us",
+      "opening": "specific page/router opening for us, written as a strategic content angle, not sales copy",
       "rawAnswer": "compact reconstructed answer notes, not long prose",
       "score": 0
     }
   ]
 }
 
-Scoring guidance, 0-100:
-75-100 = strong opening for a focused page/test.
-50-74 = promising but needs another batch.
-30-49 = mild signal only.
-0-29 = weak or crowded/noisy.
+Scoring guidance:
+90-100 = rare. Strong buyer intent, clear weak answer pattern, fragmented local providers, directory dependence, pre-action uncertainty, and source-backed evidence.
+75-89 = strong opening, but only if evidence is credible or the pattern is unusually clear.
+55-74 = promising test candidate.
+35-54 = mild signal only.
+0-34 = weak, crowded, generic, or unsupported.
 
-Score higher when the query has clear buyer intent, visible local fragmentation, weak/generic answers, heavy directory/aggregator dependence, national brands overrepresented, local operators present but poorly differentiated, and a strong pre-action decision angle. Score lower when the query is already well served by authoritative local sources, has no buyer intent, or produces no useful content/lead-gen opening.`;
+In Fast Scout mode, avoid scores above 74 unless the query has extremely clear buyer intent plus strong pre-action uncertainty. In Fast Scout mode, unsupported named businesses should not create high confidence.
+
+Score higher for:
+- clear buyer/call intent
+- weak/generic AI answer pattern
+- directory/aggregator dependence
+- national brands overrepresented while local operators are fragmented
+- a real pre-action decision angle
+- user uncertainty before calling
+
+Score lower for:
+- unsupported names
+- generic local-service conclusions
+- fake precision
+- “best company” pages with no unique decision layer
+- sales-copy openings
+- no buyer intent
+- no pre-action uncertainty
+- no useful content/router wedge`;
 }
 
 function extractGeminiText(data) {
