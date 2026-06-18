@@ -1,58 +1,78 @@
-const SECRET_ENV_NAMES = [
+const SECRET_NAMES = [
   'BETO_SCOUT_PROVIDER_TOKEN',
   'AI_SCOUT_PROVIDER_TOKEN',
   'NOVA_SCOUT_PROVIDER_TOKEN',
-  'GEMINI_API_KEY' // legacy fallback only; prefer the custom names above.
+  'GEMINI_API_KEY'
 ];
 
-const MODEL_ENV_NAMES = [
+const MODEL_NAMES = [
   'BETO_SCOUT_MODEL',
   'AI_SCOUT_MODEL',
   'NOVA_SCOUT_MODEL',
-  'GEMINI_MODEL' // legacy fallback only.
+  'GEMINI_MODEL'
 ];
 
-const defaultModel = firstEnv(MODEL_ENV_NAMES) || 'gemini-1.5-flash';
+const PREFERRED_MODELS = [
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview'
+];
 
 exports.handler = async function(event) {
-  if (event.httpMethod === 'OPTIONS') {
-    return json(204, {});
-  }
+  if (event.httpMethod === 'OPTIONS') return json(204, {});
 
   if (event.httpMethod !== 'POST') {
-    return json(405, {
-      error: 'Method not allowed',
-      expected: 'POST /.netlify/functions/scout'
-    });
+    return json(405, { error: 'Method not allowed' });
   }
 
-  const apiKey = firstEnv(SECRET_ENV_NAMES);
+  const apiKey = firstEnv(SECRET_NAMES);
+
   if (!apiKey) {
     return json(500, {
-      error: 'Missing scout provider token.',
-      fix: 'In Netlify, add BETO_SCOUT_PROVIDER_TOKEN under Site configuration > Environment variables, paste only the Google AI Studio key as the value, then redeploy.',
-      acceptedNames: SECRET_ENV_NAMES.filter(name => name !== 'GEMINI_API_KEY'),
-      legacyFallback: 'GEMINI_API_KEY still works, but the custom token name is preferred.'
+      error: 'Missing provider token environment variable.',
+      fix: 'In Netlify, add BETO_SCOUT_PROVIDER_TOKEN under Site configuration > Environment variables, then clear-cache redeploy.'
     });
   }
 
   let body;
-  try { body = JSON.parse(event.body || '{}'); }
-  catch { return json(400, { error: 'Invalid JSON body.' }); }
+
+  try {
+    body = JSON.parse(event.body || '{}');
+  } catch {
+    return json(400, { error: 'Invalid JSON body.' });
+  }
 
   const { project, service, queries, mode, notes, model, scoutProvider } = body;
+
   if (!project || !service || !Array.isArray(queries) || !queries.length) {
     return json(400, { error: 'Missing project, service, or queries.' });
   }
+
   if (queries.length > 48) {
     return json(400, { error: 'Too many queries. Keep a run under 48 checks.' });
   }
 
-  const selectedModel = String(model || defaultModel).trim();
+  const requestedModel = cleanModelName(model || firstEnv(MODEL_NAMES) || '');
   const useGoogleSearch = scoutProvider === 'gemini-grounded';
-  const prompt = buildPrompt({ project, service, queries, mode, notes, useGoogleSearch });
+
+  const prompt = buildPrompt({
+    project,
+    service,
+    queries,
+    mode,
+    notes,
+    useGoogleSearch
+  });
 
   try {
+    const selectedModel = await chooseUsableModel({
+      apiKey,
+      requestedModel
+    });
+
     const data = await callGemini({
       apiKey,
       model: selectedModel,
@@ -62,23 +82,30 @@ exports.handler = async function(event) {
 
     const text = extractGeminiText(data);
     const parsed = parseJsonObject(text);
+
     if (!parsed.entries || !Array.isArray(parsed.entries)) {
       return json(502, {
         error: 'Gemini returned invalid scout JSON.',
         raw: text,
-        grounding: extractGroundingSources(data)
+        grounding: extractGroundingSources(data),
+        model: selectedModel
       });
     }
 
     const groundingSources = extractGroundingSources(data);
+
     return json(200, {
       provider: useGoogleSearch ? 'Gemini grounded scout' : 'Gemini fast scout',
       model: selectedModel,
+      requestedModel: requestedModel || null,
       grounded: useGoogleSearch,
       groundingSources,
       entries: parsed.entries.map(entry => ({
         ...entry,
-        citations: Array.isArray(entry.citations) && entry.citations.length ? entry.citations : groundingSources
+        citations:
+          Array.isArray(entry.citations) && entry.citations.length
+            ? entry.citations
+            : groundingSources
       })),
       batchSummary: parsed.batchSummary || ''
     });
@@ -86,23 +113,108 @@ exports.handler = async function(event) {
     return json(500, {
       error: err.message || 'Scout function crashed.',
       hint: useGoogleSearch
-        ? 'If grounded mode fails, try Gemini Fast Scout first. Grounding with Google Search may require a supported model, available region, quota, or billing setup.'
-        : 'Check the Google AI Studio key, model name, and Netlify function logs.',
-      envHint: 'Preferred Netlify variable name: BETO_SCOUT_PROVIDER_TOKEN. Optional model variable: BETO_SCOUT_MODEL.'
+        ? 'If grounded mode fails, try Gemini Fast Scout first. Grounding with Google Search may require a supported model, quota, region, or billing setup.'
+        : 'Check BETO_SCOUT_PROVIDER_TOKEN, remove unsupported BETO_SCOUT_MODEL values, and inspect Netlify function logs.',
+      requestedModel: requestedModel || null
     });
   }
 };
 
 function firstEnv(names) {
   for (const name of names) {
-    const value = process.env[name];
-    if (typeof value === 'string' && value.trim()) return value.trim();
+    const value = (process.env[name] || '').trim();
+
+    if (value) return value;
   }
+
   return '';
 }
 
+function cleanModelName(name) {
+  return String(name || '').trim().replace(/^models\//, '');
+}
+
+async function chooseUsableModel({ apiKey, requestedModel }) {
+  const models = await listModels(apiKey);
+
+  const usable = models
+    .filter(
+      m =>
+        Array.isArray(m.supportedGenerationMethods) &&
+        m.supportedGenerationMethods.includes('generateContent')
+    )
+    .map(m => ({
+      ...m,
+      shortName: cleanModelName(m.name)
+    }));
+
+  if (!usable.length) {
+    throw new Error(
+      'Gemini API returned no models that support generateContent for this key. Open Google AI Studio and confirm the key is active.'
+    );
+  }
+
+  if (requestedModel) {
+    const exact = usable.find(m => m.shortName === requestedModel);
+
+    if (exact) return exact.shortName;
+  }
+
+  for (const preferred of PREFERRED_MODELS) {
+    const exact = usable.find(m => m.shortName === preferred);
+
+    if (exact) return exact.shortName;
+  }
+
+  const flash = usable.find(
+    m => /flash/i.test(m.shortName) && !/image|tts|live|embedding/i.test(m.shortName)
+  );
+
+  if (flash) return flash.shortName;
+
+  const firstText = usable.find(m => !/image|tts|live|embedding/i.test(m.shortName));
+
+  if (firstText) return firstText.shortName;
+
+  return usable[0].shortName;
+}
+
+async function listModels(apiKey) {
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+    method: 'GET',
+    headers: {
+      'x-goog-api-key': apiKey
+    }
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+  const raw = await response.text();
+
+  let data;
+
+  try {
+    data = contentType.includes('application/json') ? JSON.parse(raw) : JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Gemini ListModels returned non-JSON (${response.status}). First characters: ${raw.slice(
+        0,
+        80
+      )}`
+    );
+  }
+
+  if (!response.ok) {
+    throw new Error(data.error?.message || `Gemini ListModels error (${response.status}).`);
+  }
+
+  return Array.isArray(data.models) ? data.models : [];
+}
+
 async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent`;
+
   const payload = {
     contents: [
       {
@@ -113,7 +225,8 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
     generationConfig: {
       temperature: 0.2,
       topP: 0.9,
-      maxOutputTokens: 8192
+      maxOutputTokens: 8192,
+      responseMimeType: 'application/json'
     }
   };
 
@@ -130,30 +243,45 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
     body: JSON.stringify(payload)
   });
 
+  const contentType = response.headers.get('content-type') || '';
   const raw = await response.text();
+
   let data;
+
   try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch (_) {
-    const compact = raw.slice(0, 400).replace(/\s+/g, ' ').trim();
-    throw new Error(`Gemini endpoint returned non-JSON (${response.status}). First characters: ${compact || '[empty response]'}`);
+    data = contentType.includes('application/json') ? JSON.parse(raw) : JSON.parse(raw);
+  } catch {
+    throw new Error(
+      `Gemini returned non-JSON (${response.status}) for model ${model}. First characters: ${raw.slice(
+        0,
+        80
+      )}`
+    );
   }
 
   if (!response.ok) {
-    const msg = data.error?.message || `Gemini API error (${response.status}).`;
+    const msg = data.error?.message || `Gemini API error (${response.status}) for model ${model}.`;
     throw new Error(msg);
   }
+
   return data;
 }
 
 function buildPrompt({ project, service, queries, mode, notes, useGoogleSearch }) {
   return `Run a local AI-answer scout for niche validation. The goal is not to sell a SaaS report. The goal is to extract market intelligence for a small niche-site / lead-gen operator deciding what to build.
 
-Provider mode: ${useGoogleSearch ? 'Grounded Google Search is enabled. Use current web evidence where useful, but still mark uncertainty honestly.' : 'Fast scout mode. Do not pretend to have live evidence. Use market-pattern reasoning, entity recognition, and local SEO heuristics. Mark uncertainty honestly.'}
+Provider mode: ${
+    useGoogleSearch
+      ? 'Grounded Google Search is enabled. Use current web evidence where useful, but still mark uncertainty honestly.'
+      : 'Fast scout mode. Do not pretend to have live evidence. Use market-pattern reasoning, entity recognition, and local SEO heuristics. Mark uncertainty honestly.'
+  }
 Project: ${project}
 Service category: ${service}
 Scout mode: ${mode || 'niche-validation'}
-Operator notes: ${notes || 'Prioritize weak AI answers, directory dependence, national-brand dominance, local fragmentation, pre-action uncertainty, and buyer/call intent.'}
+Operator notes: ${
+    notes ||
+    'Prioritize weak AI answers, directory dependence, national-brand dominance, local fragmentation, pre-action uncertainty, and buyer/call intent.'
+  }
 
 For each query below, infer what a consumer-facing AI/web answer would likely surface, then produce a structured record. Favor named entities, directories, sources, and observable patterns. Never claim proof of ranking. Never invent exact citations; if grounded search was unavailable or weak, say so in confidence/summary.
 
@@ -201,39 +329,51 @@ Score higher when the query has clear buyer intent, visible local fragmentation,
 
 function extractGeminiText(data) {
   const parts = [];
+
   for (const candidate of data.candidates || []) {
     for (const part of candidate.content?.parts || []) {
       if (part.text) parts.push(part.text);
     }
   }
+
   return parts.join('\n').trim();
 }
 
 function extractGroundingSources(data) {
   const seen = new Set();
   const sources = [];
+
   for (const candidate of data.candidates || []) {
     const chunks = candidate.groundingMetadata?.groundingChunks || [];
+
     for (const chunk of chunks) {
       const uri = chunk.web?.uri || chunk.retrievedContext?.uri;
+
       if (!uri || seen.has(uri)) continue;
+
       seen.add(uri);
       sources.push(uri);
     }
   }
+
   return sources;
 }
 
 function parseJsonObject(text) {
   if (!text) throw new Error('Gemini returned an empty response.');
+
   const cleaned = text
     .replace(/^```(?:json)?/i, '')
     .replace(/```$/i, '')
     .trim();
-  try { return JSON.parse(cleaned); }
-  catch (_) {
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (_) {
     const match = cleaned.match(/\{[\s\S]*\}/);
+
     if (!match) throw new Error('No JSON object found in Gemini output.');
+
     return JSON.parse(match[0]);
   }
 }
