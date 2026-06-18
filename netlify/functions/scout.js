@@ -16,166 +16,160 @@ const PREFERRED_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
   'gemini-2.0-flash',
-  'gemini-2.0-flash-lite',
-  'gemini-3.1-flash-lite',
-  'gemini-3-flash-preview'
+  'gemini-2.0-flash-lite'
 ];
 
-exports.handler = async function(event) {
-  if (event.httpMethod === 'OPTIONS') return json(204, {});
+exports.handler = async function (event) {
+  if (event.httpMethod === 'OPTIONS') {
+    return json(204, {});
+  }
 
   if (event.httpMethod !== 'POST') {
-    return json(405, { error: 'Method not allowed' });
-  }
-
-  const apiKey = firstEnv(SECRET_NAMES);
-
-  if (!apiKey) {
-    return json(500, {
-      error: 'Missing provider token environment variable.',
-      fix: 'In Netlify, add BETO_SCOUT_PROVIDER_TOKEN under Site configuration > Environment variables, then clear-cache redeploy.'
+    return json(405, {
+      error: 'Method not allowed',
+      note: 'The scout function is deployed. Use the app UI to run POST requests.'
     });
   }
 
-  let body;
-
   try {
-    body = JSON.parse(event.body || '{}');
-  } catch {
-    return json(400, { error: 'Invalid JSON body.' });
-  }
+    const apiKey = firstEnv(SECRET_NAMES);
 
-  const { project, service, queries, mode, notes, model, scoutProvider } = body;
+    if (!apiKey) {
+      return json(500, {
+        error: 'Missing BETO_SCOUT_PROVIDER_TOKEN.',
+        fix: 'Add BETO_SCOUT_PROVIDER_TOKEN in Netlify environment variables, then clear-cache redeploy.'
+      });
+    }
 
-  if (!project || !service || !Array.isArray(queries) || !queries.length) {
-    return json(400, { error: 'Missing project, service, or queries.' });
-  }
+    const body = JSON.parse(event.body || '{}');
+    const project = String(body.project || '').trim();
+    const service = String(body.service || '').trim();
+    const queries = Array.isArray(body.queries) ? body.queries : [];
+    const mode = String(body.mode || 'niche-validation').trim();
+    const notes = String(body.notes || '').trim();
+    const scoutProvider = String(body.scoutProvider || 'gemini-fast').trim();
+    const requestedModel = cleanModelName(body.model || firstEnv(MODEL_NAMES) || '');
 
-  if (queries.length > 48) {
-    return json(400, { error: 'Too many queries. Keep a run under 48 checks.' });
-  }
+    if (!project || !service || !queries.length) {
+      return json(400, {
+        error: 'Missing project, service, or queries.'
+      });
+    }
 
-  const requestedModel = cleanModelName(model || firstEnv(MODEL_NAMES) || '');
-  const useGoogleSearch = scoutProvider === 'gemini-grounded';
+    if (queries.length > 48) {
+      return json(400, {
+        error: 'Too many queries. Keep one run under 48 checks.'
+      });
+    }
 
-  const prompt = buildPrompt({
-    project,
-    service,
-    queries,
-    mode,
-    notes,
-    useGoogleSearch
-  });
+    const useGoogleSearch = scoutProvider === 'gemini-grounded';
+    const selectedModel = await chooseModel(apiKey, requestedModel);
 
-  try {
-    const selectedModel = await chooseUsableModel({
-      apiKey,
-      requestedModel
+    const prompt = buildPrompt({
+      project,
+      service,
+      queries,
+      mode,
+      notes,
+      useGoogleSearch
     });
 
-    const data = await callGemini({
+    const geminiData = await callGemini({
       apiKey,
       model: selectedModel,
       prompt,
       useGoogleSearch
     });
 
-    const text = extractGeminiText(data);
-    const parsed = parseJsonObject(text);
+    const text = extractText(geminiData);
+    const parsed = parseJson(text);
 
-    if (!parsed.entries || !Array.isArray(parsed.entries)) {
+    if (!parsed || !Array.isArray(parsed.entries)) {
       return json(502, {
-        error: 'Gemini returned invalid scout JSON.',
+        error: 'Gemini returned JSON, but not the expected entries array.',
         raw: text,
-        grounding: extractGroundingSources(data),
         model: selectedModel
       });
     }
 
-    const groundingSources = extractGroundingSources(data);
+    const groundingSources = extractGroundingSources(geminiData);
 
     const entries = parsed.entries.map(entry =>
       normalizeEntry({
         entry,
-        groundingSources,
-        useGoogleSearch
+        project,
+        service,
+        useGoogleSearch,
+        groundingSources
       })
     );
 
     return json(200, {
       provider: useGoogleSearch ? 'Gemini grounded scout' : 'Gemini fast scout',
       model: selectedModel,
-      requestedModel: requestedModel || null,
       grounded: useGoogleSearch,
       groundingSources,
-      entries,
-      batchSummary: parsed.batchSummary || ''
+      batchSummary: parsed.batchSummary || '',
+      entries
     });
-  } catch (err) {
+  } catch (error) {
     return json(500, {
-      error: err.message || 'Scout function crashed.',
-      hint: useGoogleSearch
-        ? 'If grounded mode fails, try Gemini Fast Scout first. Grounding with Google Search may require a supported model, quota, region, or billing setup.'
-        : 'Check BETO_SCOUT_PROVIDER_TOKEN, remove unsupported BETO_SCOUT_MODEL values, and inspect Netlify function logs.',
-      requestedModel: requestedModel || null
+      error: error.message || 'Scout function crashed.',
+      hint: 'If this keeps failing, open Netlify > Functions > scout > Logs. Also confirm BETO_SCOUT_PROVIDER_TOKEN exists and BETO_SCOUT_MODEL is blank.'
     });
   }
 };
 
 function firstEnv(names) {
   for (const name of names) {
-    const value = (process.env[name] || '').trim();
+    const value = String(process.env[name] || '').trim();
     if (value) return value;
   }
-
   return '';
 }
 
-function cleanModelName(name) {
-  return String(name || '').trim().replace(/^models\//, '');
+function cleanModelName(value) {
+  return String(value || '').trim().replace(/^models\//, '');
 }
 
-async function chooseUsableModel({ apiKey, requestedModel }) {
+async function chooseModel(apiKey, requestedModel) {
   const models = await listModels(apiKey);
 
   const usable = models
-    .filter(
-      m =>
-        Array.isArray(m.supportedGenerationMethods) &&
-        m.supportedGenerationMethods.includes('generateContent')
-    )
-    .map(m => ({
-      ...m,
-      shortName: cleanModelName(m.name)
+    .filter(model => {
+      return (
+        Array.isArray(model.supportedGenerationMethods) &&
+        model.supportedGenerationMethods.includes('generateContent')
+      );
+    })
+    .map(model => ({
+      fullName: model.name,
+      shortName: cleanModelName(model.name)
     }));
 
   if (!usable.length) {
-    throw new Error(
-      'Gemini API returned no models that support generateContent for this key. Open Google AI Studio and confirm the key is active.'
-    );
+    throw new Error('No Gemini models supporting generateContent were found for this API key.');
   }
 
   if (requestedModel) {
-    const exact = usable.find(m => m.shortName === requestedModel);
+    const exact = usable.find(model => model.shortName === requestedModel);
     if (exact) return exact.shortName;
   }
 
   for (const preferred of PREFERRED_MODELS) {
-    const exact = usable.find(m => m.shortName === preferred);
+    const exact = usable.find(model => model.shortName === preferred);
     if (exact) return exact.shortName;
   }
 
-  const flash = usable.find(
-    m => /flash/i.test(m.shortName) && !/image|tts|live|embedding/i.test(m.shortName)
-  );
+  const flash = usable.find(model => {
+    return /flash/i.test(model.shortName) && !/image|tts|embedding|live/i.test(model.shortName);
+  });
 
   if (flash) return flash.shortName;
 
-  const firstText = usable.find(m => !/image|tts|live|embedding/i.test(m.shortName));
+  const textModel = usable.find(model => !/image|tts|embedding|live/i.test(model.shortName));
 
-  if (firstText) return firstText.shortName;
-
-  return usable[0].shortName;
+  return (textModel || usable[0]).shortName;
 }
 
 async function listModels(apiKey) {
@@ -186,33 +180,24 @@ async function listModels(apiKey) {
     }
   });
 
-  const contentType = response.headers.get('content-type') || '';
   const raw = await response.text();
-
   let data;
 
   try {
-    data = contentType.includes('application/json') ? JSON.parse(raw) : JSON.parse(raw);
+    data = JSON.parse(raw);
   } catch {
-    throw new Error(
-      `Gemini ListModels returned non-JSON (${response.status}). First characters: ${raw.slice(
-        0,
-        80
-      )}`
-    );
+    throw new Error(`Gemini ListModels returned non-JSON. Status ${response.status}. First chars: ${raw.slice(0, 80)}`);
   }
 
   if (!response.ok) {
-    throw new Error(data.error?.message || `Gemini ListModels error (${response.status}).`);
+    throw new Error(data.error && data.error.message ? data.error.message : `Gemini ListModels error ${response.status}`);
   }
 
   return Array.isArray(data.models) ? data.models : [];
 }
 
 async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
-    model
-  )}:generateContent`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
   const payload = {
     contents: [
@@ -233,7 +218,7 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
     payload.tools = [{ google_search: {} }];
   }
 
-  const response = await fetch(endpoint, {
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'x-goog-api-key': apiKey,
@@ -242,68 +227,207 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
     body: JSON.stringify(payload)
   });
 
-  const contentType = response.headers.get('content-type') || '';
   const raw = await response.text();
-
   let data;
 
   try {
-    data = contentType.includes('application/json') ? JSON.parse(raw) : JSON.parse(raw);
+    data = JSON.parse(raw);
   } catch {
-    throw new Error(
-      `Gemini returned non-JSON (${response.status}) for model ${model}. First characters: ${raw.slice(
-        0,
-        80
-      )}`
-    );
+    throw new Error(`Gemini returned non-JSON. Status ${response.status}. First chars: ${raw.slice(0, 80)}`);
   }
 
   if (!response.ok) {
-    const msg = data.error?.message || `Gemini API error (${response.status}) for model ${model}.`;
-    throw new Error(msg);
+    throw new Error(data.error && data.error.message ? data.error.message : `Gemini API error ${response.status}`);
   }
 
   return data;
 }
 
-function normalizeEntry({ entry, groundingSources, useGoogleSearch }) {
+function buildPrompt({ project, service, queries, mode, notes, useGoogleSearch }) {
+  const queryLines = queries
+    .map((item, index) => {
+      const market = item && item.market ? item.market : 'unknown market';
+      const query = item && item.query ? item.query : '';
+      return `${index + 1}. [${market}] ${query}`;
+    })
+    .join('\n');
+
+  return `
+Run a local AI-answer scout for niche validation.
+
+This is an internal market intelligence tool for a niche-site / affiliate / lead-gen operator. It is not a SaaS sales report. Be skeptical. Penalize unsupported certainty. Do not write agency sales copy. Do not say “we connect you with vetted providers.”
+
+Provider mode:
+${useGoogleSearch ? 'Grounded Google Search requested. Use real evidence only when available. Cite real URLs only if actually used.' : 'Fast Scout mode. No live search. Treat results as pattern estimates, not proof.'}
+
+Project:
+${project}
+
+Service category:
+${service}
+
+Scout mode:
+${mode}
+
+Operator notes:
+${notes || 'Look for weak AI answers, directory dependence, local fragmentation, national-brand dominance, buyer intent, pre-action uncertainty, and focused page/router openings.'}
+
+Queries:
+${queryLines}
+
+Return ONLY valid JSON. No markdown. No commentary.
+
+Schema:
+{
+  "batchSummary": "one concise paragraph",
+  "entries": [
+    {
+      "market": "city/state",
+      "query": "exact query",
+      "answerType": "Named businesses | Generic advice | Directory-heavy | Map/local-pack style | Refusal / cannot answer | Hallucinated / suspicious",
+      "confidence": "Strong / source-backed | Medium / plausible | Weak / vague | Suspicious / hallucinated",
+      "businesses": ["business or entity names, if likely or observed"],
+      "sources": ["likely or observed sources/directories"],
+      "citations": ["real URL only if actually used"],
+      "flags": {
+        "nationalBrands": false,
+        "localOperators": false,
+        "aggregators": false,
+        "weakAnswer": false,
+        "preAction": false,
+        "buyerIntent": false
+      },
+      "summary": "brief answer landscape summary",
+      "opening": "strategic content/router opening for us, not sales copy",
+      "rawAnswer": "compact reconstructed notes",
+      "score": 0
+    }
+  ]
+}
+
+Scoring:
+90-100 = rare. Strong evidence plus strong buyer intent plus clear weak answer plus strong pre-action/router wedge.
+75-89 = strong, but only if evidence/pattern is unusually clear.
+55-74 = promising test candidate.
+35-54 = mild signal only.
+0-34 = weak or unsupported.
+
+In Fast Scout mode, avoid scores above 74 unless the pre-action decision angle is very strong. Unsupported named businesses should not create high confidence.
+
+Good openings look like:
+“Build a pre-call decision page explaining access path, deck integration, electrical disconnect, water drainage, disposal rules, and when a junk hauler may not be enough.”
+
+Bad openings look like:
+“We connect you with vetted top-rated local experts.”
+`;
+}
+
+function extractText(data) {
+  const parts = [];
+
+  for (const candidate of data.candidates || []) {
+    const contentParts = candidate.content && Array.isArray(candidate.content.parts)
+      ? candidate.content.parts
+      : [];
+
+    for (const part of contentParts) {
+      if (part.text) parts.push(part.text);
+    }
+  }
+
+  return parts.join('\n').trim();
+}
+
+function extractGroundingSources(data) {
+  const sources = [];
+  const seen = new Set();
+
+  for (const candidate of data.candidates || []) {
+    const chunks =
+      candidate.groundingMetadata && Array.isArray(candidate.groundingMetadata.groundingChunks)
+        ? candidate.groundingMetadata.groundingChunks
+        : [];
+
+    for (const chunk of chunks) {
+      const uri =
+        (chunk.web && chunk.web.uri) ||
+        (chunk.retrievedContext && chunk.retrievedContext.uri) ||
+        '';
+
+      if (uri && !seen.has(uri)) {
+        seen.add(uri);
+        sources.push(uri);
+      }
+    }
+  }
+
+  return sources;
+}
+
+function parseJson(text) {
+  if (!text) {
+    throw new Error('Gemini returned an empty response.');
+  }
+
+  const cleaned = text
+    .replace(/^```json/i, '')
+    .replace(/^```/i, '')
+    .replace(/```$/i, '')
+    .trim();
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (!match) {
+      throw new Error('No JSON object found in Gemini response.');
+    }
+    return JSON.parse(match[0]);
+  }
+}
+
+function normalizeEntry({ entry, useGoogleSearch, groundingSources }) {
+  const flags = normalizeFlags(entry.flags);
+  const citations = normalizeCitations(entry.citations, groundingSources, useGoogleSearch);
+  const businesses = toArray(entry.businesses);
+  const sources = toArray(entry.sources);
+
   const normalized = {
-    market: safeString(entry.market),
-    query: safeString(entry.query),
-    answerType: safeString(entry.answerType),
-    confidence: safeString(entry.confidence),
-    businesses: toArray(entry.businesses),
-    sources: toArray(entry.sources),
-    citations: normalizeCitations(entry.citations, groundingSources, useGoogleSearch),
-    flags: normalizeFlags(entry.flags),
-    summary: safeString(entry.summary),
-    opening: rewriteOpening(safeString(entry.opening), safeString(entry.query), safeString(entry.summary)),
-    rawAnswer: safeString(entry.rawAnswer),
-    score: clampScore(entry.score)
+    market: stringValue(entry.market),
+    query: stringValue(entry.query),
+    answerType: stringValue(entry.answerType),
+    confidence: stringValue(entry.confidence),
+    businesses,
+    sources,
+    citations,
+    flags,
+    summary: stringValue(entry.summary),
+    opening: cleanOpening(stringValue(entry.opening)),
+    rawAnswer: stringValue(entry.rawAnswer),
+    score: clamp(entry.score)
   };
 
   const adjusted = adjustScore(normalized, useGoogleSearch);
-
   normalized.score = adjusted.score;
   normalized.scoreRationale = adjusted.rationale.join(' | ');
 
   return normalized;
 }
 
-function normalizeFlags(flags = {}) {
+function normalizeFlags(flags) {
+  const f = flags || {};
   return {
-    nationalBrands: Boolean(flags.nationalBrands),
-    localOperators: Boolean(flags.localOperators),
-    aggregators: Boolean(flags.aggregators),
-    weakAnswer: Boolean(flags.weakAnswer),
-    preAction: Boolean(flags.preAction),
-    buyerIntent: Boolean(flags.buyerIntent)
+    nationalBrands: Boolean(f.nationalBrands),
+    localOperators: Boolean(f.localOperators),
+    aggregators: Boolean(f.aggregators),
+    weakAnswer: Boolean(f.weakAnswer),
+    preAction: Boolean(f.preAction),
+    buyerIntent: Boolean(f.buyerIntent)
   };
 }
 
 function normalizeCitations(citations, groundingSources, useGoogleSearch) {
-  const fromEntry = toArray(citations).filter(Boolean);
-  const realUrls = fromEntry.filter(x => /^https?:\/\//i.test(x));
+  const realUrls = toArray(citations).filter(item => /^https?:\/\//i.test(item));
 
   if (realUrls.length) return realUrls;
 
@@ -316,108 +440,14 @@ function normalizeCitations(citations, groundingSources, useGoogleSearch) {
   ];
 }
 
-function adjustScore(entry, useGoogleSearch) {
-  let score = clampScore(entry.score);
-  const rationale = [];
+function cleanOpening(opening) {
+  const text = String(opening || '').trim();
 
-  const citationText = entry.citations.join(' ').toLowerCase();
-  const hasRealCitation = entry.citations.some(x => /^https?:\/\//i.test(x));
-  const weakCitation =
-    citationText.includes('ungrounded') ||
-    citationText.includes('unavailable') ||
-    citationText.includes('weak') ||
-    citationText.includes('no usable');
-
-  const confidence = entry.confidence.toLowerCase();
-  const answerType = entry.answerType.toLowerCase();
-  const opening = entry.opening.toLowerCase();
-  const summary = entry.summary.toLowerCase();
-
-  if (!useGoogleSearch || !hasRealCitation || weakCitation) {
-    score -= 14;
-    rationale.push('citation penalty: ungrounded/weak evidence');
+  if (!text || looksLikeSalesCopy(text)) {
+    return 'Build a pre-call decision page, not a fake best-company list. Focus on what makes this job harder than a normal pickup: access path, deck integration, electrical disconnect, water drainage, weight, cut-up/removal method, disposal rules, and when a junk hauler may not be enough.';
   }
 
-  if (confidence.includes('weak') || confidence.includes('vague')) {
-    score -= 10;
-    rationale.push('confidence penalty: weak/vague');
-  } else if (confidence.includes('medium') || confidence.includes('plausible')) {
-    score -= 6;
-    rationale.push('confidence penalty: plausible but not proven');
-  } else if (confidence.includes('suspicious') || confidence.includes('hallucinated')) {
-    score -= 22;
-    rationale.push('confidence penalty: suspicious/hallucinated');
-  }
-
-  if (entry.flags.buyerIntent) {
-    score += 8;
-    rationale.push('buyer intent bonus');
-  }
-
-  if (entry.flags.aggregators) {
-    score += 6;
-    rationale.push('aggregator dependence bonus');
-  }
-
-  if (entry.flags.weakAnswer) {
-    score += 8;
-    rationale.push('weak answer bonus');
-  }
-
-  if (entry.flags.preAction) {
-    score += 7;
-    rationale.push('pre-action angle bonus');
-  }
-
-  if (entry.flags.nationalBrands && entry.flags.localOperators) {
-    score += 4;
-    rationale.push('mixed national/local field bonus');
-  }
-
-  if (answerType.includes('directory-heavy')) {
-    score += 4;
-    rationale.push('directory-heavy bonus');
-  }
-
-  if (looksLikeSalesCopy(opening)) {
-    score -= 8;
-    rationale.push('opening penalty: sales-copy wording');
-  }
-
-  if (summary.includes('limited deep analysis') || summary.includes('generic advice') || summary.includes('star ratings')) {
-    score += 4;
-    rationale.push('shallow-answer opportunity bonus');
-  }
-
-  if (!entry.businesses.length) {
-    score -= 8;
-    rationale.push('no named entities penalty');
-  }
-
-  const allFlagsTrue = Object.values(entry.flags).every(Boolean);
-  if (allFlagsTrue && (!hasRealCitation || weakCitation)) {
-    score -= 8;
-    rationale.push('all-flags-true penalty without evidence');
-  }
-
-  score = clampScore(score);
-
-  return {
-    score,
-    rationale
-  };
-}
-
-function rewriteOpening(opening, query, summary) {
-  if (!opening || looksLikeSalesCopy(opening)) {
-    return [
-      'Build a pre-call decision page, not a fake “best company” list.',
-      'Focus on what makes this job harder than a normal pickup: access path, deck integration, electrical disconnect, water drainage, weight, cut-up/removal method, disposal rules, and when a junk hauler may not be enough.',
-      'Use the page to help the visitor decide what to check before calling, then route the call.'
-    ].join(' ');
-  }
-
-  return opening;
+  return text;
 }
 
 function looksLikeSalesCopy(text) {
@@ -430,169 +460,103 @@ function looksLikeSalesCopy(text) {
     t.includes('hassle-free') ||
     t.includes('curated list') ||
     t.includes('our platform') ||
-    t.includes('reliable local providers') ||
-    t.includes('go beyond simple listings')
+    t.includes('reliable local providers')
   );
+}
+
+function adjustScore(entry, useGoogleSearch) {
+  let score = clamp(entry.score);
+  const rationale = [];
+
+  const hasRealCitation = entry.citations.some(item => /^https?:\/\//i.test(item));
+  const confidence = entry.confidence.toLowerCase();
+
+  if (!useGoogleSearch || !hasRealCitation) {
+    score -= 14;
+    rationale.push('ungrounded evidence penalty');
+  }
+
+  if (confidence.includes('medium') || confidence.includes('plausible')) {
+    score -= 6;
+    rationale.push('medium confidence penalty');
+  }
+
+  if (confidence.includes('weak') || confidence.includes('vague')) {
+    score -= 10;
+    rationale.push('weak confidence penalty');
+  }
+
+  if (confidence.includes('suspicious') || confidence.includes('hallucinated')) {
+    score -= 22;
+    rationale.push('hallucination penalty');
+  }
+
+  if (entry.flags.buyerIntent) {
+    score += 7;
+    rationale.push('buyer intent');
+  }
+
+  if (entry.flags.aggregators) {
+    score += 5;
+    rationale.push('aggregator dependence');
+  }
+
+  if (entry.flags.weakAnswer) {
+    score += 7;
+    rationale.push('weak answer');
+  }
+
+  if (entry.flags.preAction) {
+    score += 8;
+    rationale.push('pre-action wedge');
+  }
+
+  if (entry.flags.nationalBrands && entry.flags.localOperators) {
+    score += 3;
+    rationale.push('mixed national/local field');
+  }
+
+  if (!entry.businesses.length) {
+    score -= 8;
+    rationale.push('no named entities');
+  }
+
+  if (Object.values(entry.flags).every(Boolean) && !hasRealCitation) {
+    score -= 8;
+    rationale.push('all flags true without citation penalty');
+  }
+
+  return {
+    score: clamp(score),
+    rationale
+  };
 }
 
 function toArray(value) {
   if (Array.isArray(value)) {
-    return value.map(x => String(x).trim()).filter(Boolean);
+    return value.map(item => String(item).trim()).filter(Boolean);
   }
 
   if (typeof value === 'string') {
     return value
       .split(/[,;\n]/)
-      .map(x => x.trim())
+      .map(item => item.trim())
       .filter(Boolean);
   }
 
   return [];
 }
 
-function safeString(value) {
+function stringValue(value) {
   return value == null ? '' : String(value).trim();
 }
 
-function clampScore(value) {
-  const n = Number(value);
+function clamp(value) {
+  const number = Number(value);
 
-  if (!Number.isFinite(n)) return 40;
+  if (!Number.isFinite(number)) return 45;
 
-  return Math.max(0, Math.min(100, Math.round(n)));
-}
-
-function buildPrompt({ project, service, queries, mode, notes, useGoogleSearch }) {
-  return `Run a local AI-answer scout for niche validation. The user is a small niche-site / affiliate / lead-gen operator. The goal is market intelligence, not a SaaS sales report.
-
-Be skeptical. Penalize unsupported certainty. Treat Fast Scout as pattern estimation, not proof. Do not invent exact citations or pretend live search was used. If you are not grounded, mark names and sources as likely patterns only.
-
-Provider mode: ${
-    useGoogleSearch
-      ? 'Grounded Google Search is enabled. Use current web evidence where useful. Cite real URLs only when actually used. If grounding is thin, say so.'
-      : 'Fast Scout mode. Live search is not available. Use market-pattern reasoning, entity recognition, and local SEO heuristics. Mark uncertainty honestly.'
-  }
-
-Project: ${project}
-Service category: ${service}
-Scout mode: ${mode || 'niche-validation'}
-Operator notes: ${
-    notes ||
-    'Prioritize weak AI answers, directory dependence, national-brand dominance, local fragmentation, pre-action uncertainty, buyer/call intent, and whether a focused page can beat generic AI/local-pack mush.'
-  }
-
-For each query, infer the AI/web answer landscape. Do not write marketing copy. Do not say “we connect you with vetted providers.” We are not selling the visitor a SaaS report. We are deciding whether to build a niche page, router, or lead-gen test.
-
-Queries:
-${queries.map((q, i) => `${i + 1}. [${q.market}] ${q.query}`).join('\n')}
-
-Return ONLY valid JSON. No markdown. No commentary. Start with { and end with }.
-
-Schema:
-{
-  "batchSummary": "one concise paragraph describing the repeated pattern and whether this is worth further testing",
-  "entries": [
-    {
-      "market": "city/state",
-      "query": "exact query",
-      "answerType": "Named businesses | Generic advice | Directory-heavy | Map/local-pack style | Refusal / cannot answer | Hallucinated / suspicious",
-      "confidence": "Strong / source-backed | Medium / plausible | Weak / vague | Suspicious / hallucinated",
-      "businesses": ["named business 1", "named business 2"],
-      "sources": ["source/citation/directory 1", "source/citation/directory 2"],
-      "citations": ["https://example.com/source-if-actually-used"],
-      "flags": {
-        "nationalBrands": true,
-        "localOperators": true,
-        "aggregators": true,
-        "weakAnswer": false,
-        "preAction": true,
-        "buyerIntent": true
-      },
-      "summary": "brief summary of what the answer landscape appears to show",
-      "opening": "specific page/router opening for us, written as a strategic content angle, not sales copy",
-      "rawAnswer": "compact reconstructed answer notes, not long prose",
-      "score": 0
-    }
-  ]
-}
-
-Scoring guidance:
-90-100 = rare. Strong buyer intent, clear weak answer pattern, fragmented local providers, directory dependence, pre-action uncertainty, and source-backed evidence.
-75-89 = strong opening, but only if evidence is credible or the pattern is unusually clear.
-55-74 = promising test candidate.
-35-54 = mild signal only.
-0-34 = weak, crowded, generic, or unsupported.
-
-In Fast Scout mode, avoid scores above 74 unless the query has extremely clear buyer intent plus strong pre-action uncertainty. In Fast Scout mode, unsupported named businesses should not create high confidence.
-
-Score higher for:
-- clear buyer/call intent
-- weak/generic AI answer pattern
-- directory/aggregator dependence
-- national brands overrepresented while local operators are fragmented
-- a real pre-action decision angle
-- user uncertainty before calling
-
-Score lower for:
-- unsupported names
-- generic local-service conclusions
-- fake precision
-- “best company” pages with no unique decision layer
-- sales-copy openings
-- no buyer intent
-- no pre-action uncertainty
-- no useful content/router wedge`;
-}
-
-function extractGeminiText(data) {
-  const parts = [];
-
-  for (const candidate of data.candidates || []) {
-    for (const part of candidate.content?.parts || []) {
-      if (part.text) parts.push(part.text);
-    }
-  }
-
-  return parts.join('\n').trim();
-}
-
-function extractGroundingSources(data) {
-  const seen = new Set();
-  const sources = [];
-
-  for (const candidate of data.candidates || []) {
-    const chunks = candidate.groundingMetadata?.groundingChunks || [];
-
-    for (const chunk of chunks) {
-      const uri = chunk.web?.uri || chunk.retrievedContext?.uri;
-
-      if (!uri || seen.has(uri)) continue;
-
-      seen.add(uri);
-      sources.push(uri);
-    }
-  }
-
-  return sources;
-}
-
-function parseJsonObject(text) {
-  if (!text) throw new Error('Gemini returned an empty response.');
-
-  const cleaned = text
-    .replace(/^```(?:json)?/i, '')
-    .replace(/```$/i, '')
-    .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch (_) {
-    const match = cleaned.match(/\{[\s\S]*\}/);
-
-    if (!match) throw new Error('No JSON object found in Gemini output.');
-
-    return JSON.parse(match[0]);
-  }
+  return Math.max(0, Math.min(100, Math.round(number)));
 }
 
 function json(statusCode, body) {
