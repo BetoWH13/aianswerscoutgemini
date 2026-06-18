@@ -2,44 +2,11 @@
 
 Automated local AI-answer scouting for niche validation, competitor discovery, and source mapping.
 
-This version uses **Google AI Studio / Gemini API** through a **Netlify Function**. Your API key stays server-side. The browser never sees it.
-
-## What it does
-
-You enter:
-
-- project / niche
-- service category
-- markets / cities
-- optional query templates
-- scout mode
-- Gemini mode
-
-Then the app:
-
-1. Generates local buyer-intent queries.
-2. Sends the batch to `/.netlify/functions/scout`.
-3. Calls Gemini from the serverless function.
-4. Extracts named businesses, sources/directories, weak-answer patterns, and content openings.
-5. Scores each query from 0–100.
-6. Saves results in browser localStorage.
-7. Exports CSV/JSON.
-
-## Gemini modes
-
-### Gemini Fast Scout — free-tier friendly
-
-Uses Gemini reasoning without requesting Google Search grounding. Best first test. Useful for quick niche screening and pattern detection.
-
-### Gemini Grounded Search — stronger, may need billing/quota
-
-Asks Gemini to use Google Search grounding. Better evidence, but it can require a supported model, available quota, allowed region, and/or billing depending on your account and current Google rules.
-
-If grounded mode fails, switch to Fast Scout first.
+This is an internal research aid, not a public SaaS. You enter a service niche, markets, and optional query templates. The app calls a Netlify Function, which calls Google Gemini server-side, extracts named businesses/sources/openings, scores the records, and saves them in browser localStorage.
 
 ## What it is for
 
-Use it as an internal decision tool before building niche pages, lead-gen routers, or local-service content tests.
+Use it before building niche pages, lead-gen routers, or local-service content tests.
 
 Good use cases:
 
@@ -51,75 +18,100 @@ Good use cases:
 
 ## What it is not
 
-It is not a legally defensible rank tracker. It does not impersonate ChatGPT, Gemini, Perplexity, or Google AI Overviews. It does not prove that a business ranks in every user's AI answer.
+It is not a legally defensible rank tracker. It does not impersonate every platform. It does not prove that ChatGPT, Gemini, Perplexity, or Google will show the same answer to every user.
 
-Treat it as directional market intelligence.
+Treat outputs as directional market intelligence.
 
-## Deploy to Netlify
+## Netlify environment variables
 
-Use the **GitHub repo method** for this project because it includes a Netlify Function. Simple drag-and-drop is great for static pages, but functions are more reliable through Git/Netlify build deployment.
+Use a custom variable name instead of the obvious generic key name.
 
-### GitHub repo method
-
-1. Create a GitHub repo, for example `ai-answer-scout-gemini`.
-2. Upload/push these files.
-3. In Netlify, choose **Add new site → Import an existing project**.
-4. Connect the repo.
-5. Build command: leave blank, or use `npm install` only if Netlify asks.
-6. Publish directory: `.`
-7. Functions directory is already set in `netlify.toml`:
-
-```toml
-[build]
-  publish = "."
-  functions = "netlify/functions"
-```
-
-8. Add this environment variable in Netlify:
+Required:
 
 ```txt
-GEMINI_API_KEY=your_api_key_here
+BETO_SCOUT_PROVIDER_TOKEN=your_google_ai_studio_key_here
 ```
 
 Optional:
 
 ```txt
-GEMINI_MODEL=gemini-2.5-flash
+BETO_SCOUT_MODEL=gemini-1.5-flash
 ```
 
-9. Redeploy.
-10. Open the site and run a Fast Scout batch first.
-
-## Get a Gemini API key
-
-1. Open Google AI Studio.
-2. Go to API keys.
-3. Create or copy a Gemini API key.
-4. Put it in Netlify as `GEMINI_API_KEY`.
-5. Do **not** paste it into `app.js`, `index.html`, GitHub, or any browser-visible file.
-
-## Local development
-
-Install dependencies:
-
-```bash
-npm install
-```
-
-Create `.env` in the project root:
+The function also accepts these aliases if you need them later:
 
 ```txt
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
+AI_SCOUT_PROVIDER_TOKEN
+NOVA_SCOUT_PROVIDER_TOKEN
+GEMINI_API_KEY       # legacy fallback only
+AI_SCOUT_MODEL
+NOVA_SCOUT_MODEL
+GEMINI_MODEL         # legacy fallback only
 ```
 
-Run:
+Recommended first model while debugging:
 
-```bash
-npm run dev
+```txt
+gemini-1.5-flash
 ```
 
-Open the local Netlify URL, usually `http://localhost:8888`.
+You can test newer models later after the basic flow works.
+
+## Deploy to Netlify
+
+1. Push this folder to GitHub.
+2. In Netlify, import the GitHub repo.
+3. Use these build settings:
+
+```txt
+Build command: leave blank
+Publish directory: .
+Functions directory: netlify/functions
+```
+
+4. Add the required environment variable:
+
+```txt
+BETO_SCOUT_PROVIDER_TOKEN=your_google_ai_studio_key_here
+```
+
+5. Optional but recommended while debugging:
+
+```txt
+BETO_SCOUT_MODEL=gemini-1.5-flash
+```
+
+6. Trigger:
+
+```txt
+Deploys → Trigger deploy → Clear cache and deploy site
+```
+
+## Quick function test
+
+Open:
+
+```txt
+https://YOUR-SITE.netlify.app/.netlify/functions/scout
+```
+
+A working function should return JSON like:
+
+```json
+{"error":"Method not allowed","expected":"POST /.netlify/functions/scout"}
+```
+
+That is good. It means the serverless function exists.
+
+## Workflow
+
+1. Enter a project/niche, such as `Hot tub removal`.
+2. Enter a service category, such as `hot tub removal service`.
+3. Enter 2–8 markets, one per line.
+4. Keep the default query templates or add your own using `{service}` and `{market}`.
+5. Run the scout batch.
+6. Sort by opportunity score.
+7. Export CSV/JSON if you want to archive the evidence.
 
 ## Scoring logic
 
@@ -136,20 +128,13 @@ The opportunity score favors:
 High score means: worth testing a focused page or repo skeleton.
 Low score means: do not chase unless other signals are strong.
 
-## Troubleshooting
+## Security notes
 
-### “Missing GEMINI_API_KEY”
+Your Google AI Studio key must stay server-side in Netlify environment variables. Do not put keys in `app.js`, `index.html`, GitHub README text, screenshots, or browser-visible files.
 
-The key is not set in Netlify, or the site was not redeployed after adding it.
+Preferred variable name:
 
-### Grounded Search fails
+```txt
+BETO_SCOUT_PROVIDER_TOKEN
+```
 
-Use Fast Scout first. Grounding may require the right model, quota, billing, or region. The app is designed so Fast Scout remains usable even if grounding is not available.
-
-### Function timeout or empty results
-
-Run fewer cities or use Fast depth. Start with 2–3 markets and 2–4 queries per market.
-
-## Security note
-
-The Gemini API key belongs only in Netlify environment variables or a local `.env` file. Never commit keys to GitHub.
