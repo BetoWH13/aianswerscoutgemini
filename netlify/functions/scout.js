@@ -107,7 +107,7 @@ exports.handler = async function (event) {
 
     if (!parsed || !Array.isArray(parsed.entries)) {
       return json(502, {
-        error: 'Gemini returned JSON, but not the expected entries array.',
+        error: 'Gemini returned text, but not the expected entries array.',
         raw: text,
         model: selectedModel
       });
@@ -218,6 +218,23 @@ async function listModels(apiKey) {
 async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
 
+  const generationConfig = {
+    temperature: useGoogleSearch ? 0.05 : 0.15,
+    topP: 0.85,
+    maxOutputTokens: 8192
+  };
+
+  /*
+    Important:
+    Gemini tool use / Google Search grounding currently does NOT support
+    responseMimeType: "application/json".
+    Fast Scout can use strict JSON mode.
+    Grounded Scout must rely on prompt discipline + parseJson().
+  */
+  if (!useGoogleSearch) {
+    generationConfig.responseMimeType = 'application/json';
+  }
+
   const payload = {
     contents: [
       {
@@ -225,12 +242,7 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
         parts: [{ text: prompt }]
       }
     ],
-    generationConfig: {
-      temperature: 0.15,
-      topP: 0.85,
-      maxOutputTokens: 8192,
-      responseMimeType: 'application/json'
-    }
+    generationConfig
   };
 
   if (useGoogleSearch) {
@@ -277,7 +289,7 @@ Run a local AI-answer scout for niche validation.
 This is an internal market intelligence tool for a niche-site / affiliate / lead-gen operator. It is not a SaaS sales report. Be skeptical. Penalize unsupported certainty. Do not write agency sales copy. Do not say “we connect you with vetted providers.”
 
 Provider mode:
-${useGoogleSearch ? 'Grounded Google Search requested. Use real evidence only when available. Cite real URLs only if actually used.' : 'Fast Scout mode. No live search. Treat results as pattern estimates, not proof.'}
+${useGoogleSearch ? 'Grounded Google Search requested. Use real evidence only when available. Cite real URLs only if actually used. Return valid JSON anyway, even though JSON mode is not enforced.' : 'Fast Scout mode. No live search. Treat results as pattern estimates, not proof.'}
 
 Project:
 ${project}
@@ -294,7 +306,7 @@ ${notes || 'Look for weak AI answers, directory dependence, local fragmentation,
 Queries:
 ${queryLines}
 
-Return ONLY valid JSON. No markdown. No commentary.
+Return ONLY valid JSON. No markdown. No commentary. No code fence.
 
 Schema:
 {
@@ -490,9 +502,9 @@ function adjustScore(entry, useGoogleSearch) {
   const hasRealCitation = entry.citations.some(item => /^https?:\/\//i.test(item));
   const confidence = entry.confidence.toLowerCase();
 
-  if (!useGoogleSearch || !hasRealCitation) {
-    score -= 14;
-    rationale.push('ungrounded evidence penalty');
+  if (!hasRealCitation) {
+    score -= useGoogleSearch ? 8 : 14;
+    rationale.push(useGoogleSearch ? 'grounded mode but no usable citation' : 'ungrounded evidence penalty');
   }
 
   if (confidence.includes('medium') || confidence.includes('plausible')) {
