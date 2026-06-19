@@ -45,10 +45,10 @@
 
         <div class="grid two">
           <label>Markets <small>one per line; 2–8 is sane</small>
-            <textarea id="markets" rows="7" placeholder="Salt Lake City, UT\nDenver, CO\nBoise, ID" required></textarea>
+            <textarea id="markets" rows="7" placeholder="Salt Lake City, UT&#10;Denver, CO&#10;Boise, ID" required></textarea>
           </label>
           <label>Custom query templates <small>optional; use {service} and {market}</small>
-            <textarea id="templates" rows="7" placeholder="best {service} in {market}\nwho offers {service} near {market}\n{service} cost in {market}\nwhat to check before hiring a {service} in {market}"></textarea>
+            <textarea id="templates" rows="7" placeholder="best {service} in {market}&#10;who offers {service} near {market}&#10;{service} cost in {market}&#10;what to check before hiring a {service} in {market}"></textarea>
           </label>
         </div>
 
@@ -60,6 +60,7 @@
               <option value="deep">Deep — 6 queries per market</option>
             </select>
           </label>
+
           <label>Scout mode
             <select id="mode">
               <option value="niche-validation" selected>Niche validation</option>
@@ -68,10 +69,11 @@
               <option value="lead-gen-router">Lead-gen router</option>
             </select>
           </label>
+
           <label>Gemini provider mode
             <select id="scoutProvider">
-              <option value="gemini-fast" selected>Gemini Fast Scout — free-tier friendly</option>
-              <option value="gemini-grounded">Gemini Grounded Search — stronger, may need billing/quota</option>
+              <option value="gemini-fast" selected>Gemini Fast Scout — pattern estimate, no live search</option>
+              <option value="gemini-grounded">Gemini Grounded Search — asks Gemini to use Google Search grounding</option>
             </select>
           </label>
         </div>
@@ -81,7 +83,7 @@
             <input id="model" placeholder="gemini-2.5-flash or leave blank" />
           </label>
           <div class="field-note">
-            <strong>Recommended start:</strong> use Fast Scout first. Try Grounded Search only after the basic Gemini key works. Because of course the button that says “search the web” is where billing gremlins live.
+            <strong>Recommended start:</strong> use Fast Scout first. Grounded Search is slower, may need billing/quota support, and can be crankier because the web-search goblin has opinions.
           </div>
         </div>
 
@@ -170,10 +172,22 @@
       <p class="eyebrow">Reality note</p>
       <h2>What “automated” means here</h2>
       <div class="method-grid">
-        <div><strong>It runs the scout batch.</strong><p>Fast Scout uses Gemini reasoning. Grounded Search asks Gemini to use Google Search grounding when your account/model supports it.</p></div>
-        <div><strong>It does not impersonate every platform.</strong><p>ChatGPT, Gemini, Perplexity, and Google AI each have their own behavior. This is automated scouting, not legal-grade platform rank tracking.</p></div>
-        <div><strong>It needs one Gemini API key.</strong><p>True automation requires a server-side API provider. Store GEMINI_API_KEY as a Netlify environment variable, never in browser code.</p></div>
-        <div><strong>It is for niche decisions.</strong><p>Use it to decide what to build, which cities to test, and where weak answer patterns appear. Do not sell it as ranking proof.</p></div>
+        <div>
+          <strong>Fast Scout does not live-search.</strong>
+          <p>Fast Scout uses Gemini reasoning to estimate the likely answer pattern. It is directional intelligence, not verified SERP evidence.</p>
+        </div>
+        <div>
+          <strong>Grounded Search asks Gemini to search.</strong>
+          <p>Grounded mode asks Gemini to use Google Search grounding when the selected model/account supports it. It may return citations, but it is not the same as a manual Google top-10 SERP.</p>
+        </div>
+        <div>
+          <strong>It needs server-side secrets.</strong>
+          <p>Use BETO_SCOUT_PROVIDER_TOKEN for the Gemini API key and BETO_SCOUT_APP_PASSWORD for the private app lock. Never put API keys in browser code.</p>
+        </div>
+        <div>
+          <strong>It is for niche decisions.</strong>
+          <p>Use it to decide what to build, which angles to test, and where weak answer patterns appear. Do not sell it as ranking proof.</p>
+        </div>
       </div>
     </section>
   </main>
