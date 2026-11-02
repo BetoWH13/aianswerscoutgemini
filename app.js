@@ -127,33 +127,49 @@ async function runScout(e) {
   try {
     const appPassword = getScoutPassword();
 
-    const res = await fetch('/.netlify/functions/scout', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Scout-Password': appPassword
-      },
-      body: JSON.stringify({ project, service, markets, queries, mode, model, scoutProvider, notes })
-    });
+    // Keep each provider call small enough for Netlify's synchronous function limit.
+    // Grounded searches are slower, so they are sent individually.
+    const chunkSize = scoutProvider === 'gemini-grounded' ? 1 : 2;
+    const combinedEntries = [];
+    let providerLabel = 'Gemini scout';
 
-    const rawResponse = await res.text();
-    let payload;
+    for (let offset = 0; offset < queries.length; offset += chunkSize) {
+      const chunk = queries.slice(offset, offset + chunkSize);
+      $('runStatus').textContent = 'Scouting questions ' + (offset + 1) + '–' +
+        (offset + chunk.length) + ' of ' + queries.length + '...';
 
-    try {
-      payload = JSON.parse(rawResponse);
-    } catch {
-      throw new Error(`Scout function returned non-JSON. First chars: ${rawResponse.slice(0, 80)}`);
+      const res = await fetch('/.netlify/functions/scout', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Scout-Password': appPassword
+        },
+        body: JSON.stringify({ project, service, markets, queries: chunk, mode, model, scoutProvider, notes })
+      });
+
+      const rawResponse = await res.text();
+      let chunkPayload;
+      try {
+        chunkPayload = JSON.parse(rawResponse);
+      } catch {
+        throw new Error('Questions ' + (offset + 1) + '–' + (offset + chunk.length) +
+          ': Function returned non-JSON: ' + rawResponse.slice(0, 80));
+      }
+
+      if (res.status === 401) {
+        clearScoutPassword();
+        throw new Error('Private scout password required. Reload and enter the correct app password.');
+      }
+      if (!res.ok) {
+        throw new Error('Questions ' + (offset + 1) + '–' + (offset + chunk.length) +
+          ': ' + (chunkPayload.error || 'Scout function failed.'));
+      }
+
+      providerLabel = chunkPayload.provider || providerLabel;
+      combinedEntries.push(...(chunkPayload.entries || []));
     }
 
-    if (res.status === 401) {
-      clearScoutPassword();
-      throw new Error('Private scout password required. Reload and enter the correct app password.');
-    }
-
-    if (!res.ok) {
-      throw new Error(payload.error || 'Scout function failed.');
-    }
-
+    const payload = { provider: providerLabel, entries: combinedEntries };
     const now = new Date().toISOString();
 
     const entries = (payload.entries || []).map(entry => {
