@@ -17,8 +17,8 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 6000;
 const GENERATION_TIMEOUT_MS = 18000;
 
 const PREFERRED_MODELS = [
-  'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite'
 ];
@@ -230,7 +230,7 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
   const generationConfig = {
     temperature: useGoogleSearch ? 0.05 : 0.15,
     topP: 0.85,
-    maxOutputTokens: 8192
+    maxOutputTokens: useGoogleSearch ? 8192 : 4096
   };
 
   /*
