@@ -17,11 +17,18 @@ const MODEL_DISCOVERY_TIMEOUT_MS = 6000;
 const GENERATION_TIMEOUT_MS = 18000;
 
 const PREFERRED_MODELS = [
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-3.6-flash',
+  'gemini-3.8-flash'
+];
+
+const RESTRICTED_LEGACY_MODELS = new Set([
   'gemini-2.5-flash-lite',
   'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite'
-];
+]);
 
 exports.handler = async function (event) {
   if (event.httpMethod === 'OPTIONS') {
@@ -181,7 +188,7 @@ async function chooseModel(apiKey, requestedModel) {
 
   if (requestedModel) {
     const exact = usable.find(model => model.shortName === requestedModel);
-    if (exact) return exact.shortName;
+    if (exact && !RESTRICTED_LEGACY_MODELS.has(exact.shortName)) return exact.shortName;
   }
 
   for (const preferred of PREFERRED_MODELS) {
@@ -190,14 +197,23 @@ async function chooseModel(apiKey, requestedModel) {
   }
 
   const flash = usable.find(model => {
-    return /flash/i.test(model.shortName) && !/image|tts|embedding|live/i.test(model.shortName);
+    return /flash/i.test(model.shortName) &&
+      !/image|tts|embedding|live/i.test(model.shortName) &&
+      !RESTRICTED_LEGACY_MODELS.has(model.shortName);
   });
 
   if (flash) return flash.shortName;
 
-  const textModel = usable.find(model => !/image|tts|embedding|live/i.test(model.shortName));
+  const textModel = usable.find(model =>
+    !/image|tts|embedding|live/i.test(model.shortName) &&
+    !RESTRICTED_LEGACY_MODELS.has(model.shortName)
+  );
 
-  return (textModel || usable[0]).shortName;
+  if (!textModel) {
+    throw new Error('No compatible Gemini model found. Check available models and project access.');
+  }
+
+  return textModel.shortName;
 }
 
 async function listModels(apiKey) {
