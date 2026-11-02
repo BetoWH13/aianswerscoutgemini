@@ -12,6 +12,10 @@ const MODEL_NAMES = [
   'GEMINI_MODEL'
 ];
 
+// Keep both upstream calls below Netlify's observed ~30-second response limit.
+const MODEL_DISCOVERY_TIMEOUT_MS = 6000;
+const GENERATION_TIMEOUT_MS = 18000;
+
 const PREFERRED_MODELS = [
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',
@@ -84,7 +88,9 @@ exports.handler = async function (event) {
     }
 
     const useGoogleSearch = scoutProvider === 'gemini-grounded';
+    console.info('[scout] model discovery started');
     const selectedModel = await chooseModel(apiKey, requestedModel);
+    console.info('[scout] model discovery completed');
 
     const prompt = buildPrompt({
       project,
@@ -95,6 +101,7 @@ exports.handler = async function (event) {
       useGoogleSearch
     });
 
+    console.info('[scout] generation started', { model: selectedModel, checks: queries.length, grounded: useGoogleSearch });
     const geminiData = await callGemini({
       apiKey,
       model: selectedModel,
@@ -102,6 +109,7 @@ exports.handler = async function (event) {
       useGoogleSearch
     });
 
+    console.info('[scout] generation completed');
     const text = extractText(geminiData);
     const parsed = parseJson(text);
 
@@ -132,7 +140,8 @@ exports.handler = async function (event) {
       entries
     });
   } catch (error) {
-    return json(500, {
+    console.error('[scout] request failed', { name: error.name, message: error.message });
+    return json(error.name === 'TimeoutError' ? 504 : 500, {
       error: error.message || 'Scout function crashed.',
       hint: 'If this keeps failing, open Netlify > Functions > scout > Logs. Confirm BETO_SCOUT_PROVIDER_TOKEN exists, BETO_SCOUT_APP_PASSWORD exists, and BETO_SCOUT_MODEL is blank.'
     });
@@ -192,12 +201,12 @@ async function chooseModel(apiKey, requestedModel) {
 }
 
 async function listModels(apiKey) {
-  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models', {
+  const response = await fetchWithDeadline('https://generativelanguage.googleapis.com/v1beta/models', {
     method: 'GET',
     headers: {
       'x-goog-api-key': apiKey
     }
-  });
+  }, MODEL_DISCOVERY_TIMEOUT_MS, 'Gemini model discovery');
 
   const raw = await response.text();
   let data;
@@ -249,14 +258,14 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
     payload.tools = [{ google_search: {} }];
   }
 
-  const response = await fetch(url, {
+  const response = await fetchWithDeadline(url, {
     method: 'POST',
     headers: {
       'x-goog-api-key': apiKey,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify(payload)
-  });
+  }, GENERATION_TIMEOUT_MS, 'Gemini content generation');
 
   const raw = await response.text();
   let data;
@@ -272,6 +281,26 @@ async function callGemini({ apiKey, model, prompt, useGoogleSearch }) {
   }
 
   return data;
+}
+
+async function fetchWithDeadline(url, options, timeoutMs, stage) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    // Reading the body is also bounded by the same timer.
+    const body = await response.text();
+    return { ok: response.ok, status: response.status, text: async () => body };
+  } catch (error) {
+    if (controller.signal.aborted) {
+      const timeout = new Error(stage + ' exceeded ' + timeoutMs / 1000 + ' seconds. Try fewer checks or a smaller model.');
+      timeout.name = 'TimeoutError';
+      throw timeout;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function buildPrompt({ project, service, queries, mode, notes, useGoogleSearch }) {
